@@ -9,63 +9,40 @@ from pymavlink import mavutil
 from threading import Thread
 from collections import defaultdict
 
-camera_matrix = np.array(
-    [[448.44050858, 0, 302.36894562], [0, 450.05835973, 244.72255502], [0, 0, 1]]
-)
-dist_coeffs = np.array([0.26974184, -1.56360967, -0.00950144, -0.00800682, 3.5658071])
-marker_size = 0.5
+# === Constants and Parameters ===
+CAMERA_MATRIX = np.array([[448.44, 0, 302.37], [0, 450.06, 244.72], [0, 0, 1]])
+DIST_COEFFS = np.array([0.2697, -1.5636, -0.0095, -0.0080, 3.5658])
+MARKER_SIZE = 0.5
+OUT_DIR = "marker_images"
+CSV_FILE = "global_coordinate.csv"
+VIDEO_FILE = "output.avi"
 
-
+# === Load Camera to Drone Transform ===
 def load_cam_to_drone_transform(path="cam_to_drone_transform.csv"):
     try:
         with open(path, "r") as f:
             lines = list(csv.reader(f))
-        R = np.array(
-            [
-                list(map(float, lines[1])),
-                list(map(float, lines[2])),
-                list(map(float, lines[3])),
-            ]
-        )
+        R = np.array([list(map(float, lines[1])),
+                      list(map(float, lines[2])),
+                      list(map(float, lines[3]))])
         T = np.array(list(map(float, lines[5])))
         return R, T
     except Exception as e:
-        print(f"❌ Error loading cam_to_drone_transform: {e}")
-        exit(1)
-
+        raise RuntimeError(f"Error loading cam_to_drone_transform: {e}")
 
 R_cam2drone, T_cam2drone = load_cam_to_drone_transform()
 
-aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
-aruco_params = aruco.DetectorParameters()
-detector = aruco.ArucoDetector(aruco_dict, aruco_params)
-
-state = {
-    "lat": None,
-    "lon": None,
-    "alt": None,
-    "roll": None,
-    "pitch": None,
-    "yaw": None,
-    "baro_alt": None,
-}
-marker_data = defaultdict(list)
-
-
+# === MAVLink Setup ===
 def connect_to_sitl():
     try:
-        master = mavutil.mavlink_connection(
-            input("Enter connection string (e.g. udp:127.0.0.1:14550) : ")
-        )
+        master = mavutil.mavlink_connection(input("Enter connection string (e.g. udp:127.0.0.1:14550): "))
         master.wait_heartbeat(timeout=10)
         print("✔ Connected to vehicle")
         return master
     except Exception as e:
-        print(f"❌ MAVLink connection failed: {e}")
-        exit(1)
+        raise ConnectionError(f"MAVLink connection failed: {e}")
 
-
-def mav_listener(master):
+def mav_listener(master, state):
     try:
         while True:
             msg = master.recv_match(blocking=True)
@@ -83,63 +60,48 @@ def mav_listener(master):
             elif t == "VFR_HUD":
                 state["baro_alt"] = msg.alt
     except Exception as e:
-        print(f"❌ Error in MAV listener: {e}")
+        print(f"❌ MAV listener error: {e}")
 
-
+# === Coordinate Transform ===
 def cam_to_world(tvec_cam, roll, pitch, yaw):
     try:
         tvec_drone = R_cam2drone @ tvec_cam + T_cam2drone
-        Rx = np.array(
-            [
-                [1, 0, 0],
-                [0, np.cos(roll), -np.sin(roll)],
-                [0, np.sin(roll), np.cos(roll)],
-            ]
-        )
-        Ry = np.array(
-            [
-                [np.cos(pitch), 0, np.sin(pitch)],
-                [0, 1, 0],
-                [-np.sin(pitch), 0, np.cos(pitch)],
-            ]
-        )
-        Rz = np.array(
-            [[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]]
-        )
-        return (Rz @ Ry @ Rx) @ tvec_drone
+        Rx = np.array([[1, 0, 0], [0, np.cos(roll), -np.sin(roll)], [0, np.sin(roll), np.cos(roll)]])
+        Ry = np.array([[np.cos(pitch), 0, np.sin(pitch)], [0, 1, 0], [-np.sin(pitch), 0, np.cos(pitch)]])
+        Rz = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
+        return Rz @ Ry @ Rx @ tvec_drone
     except Exception as e:
-        print(f"❌ Error in coordinate transform: {e}")
-        return np.array([0, 0, 0])
+        print(f"❌ Transform error: {e}")
+        return np.zeros(3)
 
-
-try:
+# === Main Execution ===
+def main():
     cap = cv2.VideoCapture("/dev/video4")
     if not cap.isOpened():
-        raise IOError("Camera not accessible")
-
-    print("▶ VideoCapture started")
+        raise IOError("❌ Camera not accessible")
 
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fourcc = cv2.VideoWriter_fourcc(*"XVID")
-    video_writer = cv2.VideoWriter(
-        "output.avi", fourcc, 20.0, (frame_width, frame_height)
-    )
+    video_writer = cv2.VideoWriter(VIDEO_FILE, cv2.VideoWriter_fourcc(*"XVID"), 20.0, (frame_width, frame_height))
 
-    out_dir = "marker_images"
-    shutil.rmtree(out_dir, ignore_errors=True)
-    os.makedirs(out_dir, exist_ok=True)
+    shutil.rmtree(OUT_DIR, ignore_errors=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+    detector = aruco.ArucoDetector(aruco_dict, aruco.DetectorParameters())
 
     master = connect_to_sitl()
-    Thread(target=mav_listener, args=(master,), daemon=True).start()
+    state = defaultdict(lambda: None)
+    Thread(target=mav_listener, args=(master, state), daemon=True).start()
 
+    marker_data = defaultdict(list)
     t0 = time.time()
-    f_counter = 0
     fps = 0
+    f_counter = 0
     frame_idx = 0
 
-    while True:
-        try:
+    try:
+        while True:
             ok, frame = cap.read()
             if not ok:
                 continue
@@ -148,169 +110,64 @@ try:
             corners, ids, _ = detector.detectMarkers(gray)
 
             lat, lon, alt = state["lat"], state["lon"], state["alt"]
-            roll = state["roll"]
-            pitch = state["pitch"]
-            yaw = state["yaw"]
+            roll, pitch, yaw = state["roll"], state["pitch"], state["yaw"]
             baro_alt = state["baro_alt"]
 
             if ids is not None:
-                rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
-                    corners, marker_size, camera_matrix, dist_coeffs
-                )
+                rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(corners, MARKER_SIZE, CAMERA_MATRIX, DIST_COEFFS)
+                aruco.drawDetectedMarkers(frame, corners, ids)
 
-                for i in range(len(ids)):
-                    aruco.drawDetectedMarkers(frame, corners, ids)
-                    cv2.drawFrameAxes(
-                        frame, camera_matrix, dist_coeffs, rvecs[i], tvecs[i], 0.1
-                    )
+                for i, marker_id in enumerate(ids.flatten()):
+                    t_world = cam_to_world(tvecs[i][0], roll, pitch, yaw)
+                    dist = np.linalg.norm(t_world)
+                    R_earth = 6371000.0
+                    dlat = (t_world[1] / R_earth) * 180 / np.pi
+                    dlon = (t_world[0] / (R_earth * np.cos(np.radians(lat)))) * 180 / np.pi
+                    m_lat, m_lon = lat + dlat, lon + dlon
+                    m_alt = (baro_alt or alt) - t_world[2]
+                    marker_data[marker_id].append((m_lat, m_lon, m_alt, dist, frame_idx, frame.copy()))
+                    cv2.drawFrameAxes(frame, CAMERA_MATRIX, DIST_COEFFS, rvecs[i], tvecs[i], 0.1)
 
-                    if None not in (lat, lon, alt, roll, pitch, yaw):
-                        t_world = cam_to_world(tvecs[i][0], roll, pitch, yaw)
-                        dist = np.linalg.norm(t_world)
+            # Display telemetry and orientation
+            def draw_text(label, val, y, color):
+                val_text = f"{np.degrees(val):.1f}°" if val is not None else "—"
+                cv2.putText(frame, f"{label}: {val_text}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-                        R_earth = 6371000.0
-                        dlat = (t_world[1] / R_earth) * 180 / np.pi
-                        dlon = (
-                            (t_world[0] / (R_earth * np.cos(lat * np.pi / 180)))
-                            * 180
-                            / np.pi
-                        )
-                        m_lat, m_lon = lat + dlat, lon + dlon
-                        m_alt = (baro_alt if baro_alt is not None else alt) - t_world[2]
+            gps_text = f"GPS: {lat:.6f}, {lon:.6f}, Alt: {alt:.2f}m" if lat and lon and alt else "NO GPS LOCK FOUND"
+            cv2.putText(frame, gps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255 if lat else 0, 0 if lat else 255), 2)
+            draw_text("Roll", roll, 60, (255, 100, 100))
+            draw_text("Pitch", pitch, 90, (100, 255, 100))
+            draw_text("Yaw", yaw, 120, (100, 100, 255))
 
-                        m_id = ids[i][0]
-                        marker_data[m_id].append(
-                            (m_lat, m_lon, m_alt, dist, frame_idx, frame.copy())
-                        )
-        except Exception as e:
-            print(e)
-            continue
+            f_counter += 1
+            if time.time() - t0 >= 1:
+                fps = f_counter / (time.time() - t0)
+                t0 = time.time()
+                f_counter = 0
 
-        if None not in (lat, lon, alt):
-            gps_text = f"GPS: {lat:.6f}, {lon:.6f}, Alt: {alt:.2f}m"
-            cv2.putText(
-                frame, gps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
-            )
-        else:
-            cv2.putText(
-                frame,
-                "NO GPS LOCK FOUND",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 0, 255),
-                2,
-            )
+            cv2.putText(frame, f"FPS: {fps:.2f}", (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            video_writer.write(frame)
+            cv2.imshow("ArUco Detection", frame)
 
-        def d2str(angle):
-            return f"{np.degrees(angle):.1f}°" if angle is not None else "—"
+            frame_idx += 1
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        cap.release()
+        video_writer.release()
+        cv2.destroyAllWindows()
 
-        cv2.putText(
-            frame,
-            f"Roll:  {d2str(roll)}",
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 100, 100),
-            2,
-        )
-        cv2.putText(
-            frame,
-            f"Pitch: {d2str(pitch)}",
-            (10, 90),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (100, 255, 100),
-            2,
-        )
-        cv2.putText(
-            frame,
-            f"Yaw:   {d2str(yaw)}",
-            (10, 120),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (100, 100, 255),
-            2,
-        )
-
-        if None not in (roll, pitch, yaw):
-            centre = (frame.shape[1] - 120, 100)
-            L = 50
-            try:
-                Rx = np.array(
-                    [
-                        [1, 0, 0],
-                        [0, np.cos(roll), -np.sin(roll)],
-                        [0, np.sin(roll), np.cos(roll)],
-                    ]
-                )
-                Ry = np.array(
-                    [
-                        [np.cos(pitch), 0, np.sin(pitch)],
-                        [0, 1, 0],
-                        [-np.sin(pitch), 0, np.cos(pitch)],
-                    ]
-                )
-                Rz = np.array(
-                    [
-                        [np.cos(yaw), -np.sin(yaw), 0],
-                        [np.sin(yaw), np.cos(yaw), 0],
-                        [0, 0, 1],
-                    ]
-                )
-                R = Rz @ Ry @ Rx
-                axes = {
-                    (0, 0, 255): R @ np.array([1, 0, 0]) * L,
-                    (0, 255, 0): R @ np.array([0, 1, 0]) * L,
-                    (255, 0, 0): R @ np.array([0, 0, 1]) * L,
-                }
-                for col, vec in axes.items():
-                    p1 = centre
-                    p2 = (int(centre[0] + vec[0]), int(centre[1] - vec[1]))
-                    cv2.arrowedLine(frame, p1, p2, col, 2, tipLength=0.2)
-            except Exception as e:
-                print(f"⚠️ Orientation arrow error: {e}")
-
-        f_counter += 1
-        if time.time() - t0 >= 1.0:
-            fps = f_counter / (time.time() - t0)
-            t0 = time.time()
-            f_counter = 0
-        cv2.putText(
-            frame,
-            f"FPS: {fps:.2f}",
-            (10, frame.shape[0] - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255),
-            2,
-        )
-
-        video_writer.write(frame)
-        cv2.imshow("ArUco Detection", frame)
-        frame_idx += 1
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-except Exception as e:
-    print(f"❌ Main loop crashed: {e}")
-
-finally:
-    cap.release()
-    video_writer.release()
-    cv2.destroyAllWindows()
-
-    try:
-        with open("global_coordinate.csv", "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(
-                ["Marker ID", "Latitude", "Longitude", "Altitude", "Dist(m)", "Frame"]
-            )
+        with open(CSV_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Marker ID", "Latitude", "Longitude", "Altitude", "Dist(m)", "Frame"])
             for m_id, detections in marker_data.items():
                 close = min(detections, key=lambda d: d[3])
-                w.writerow([m_id, close[0], close[1], close[2], close[3], close[4]])
-                img_name = os.path.join(out_dir, f"marker_{m_id}_frame_{close[4]}.png")
-                cv2.imwrite(img_name, close[5])
-                print(f"✔ Saved snapshot → {img_name}")
-    except Exception as e:
-        print(f"❌ Error saving CSV or images: {e}")
+                writer.writerow([m_id, close[0], close[1], close[2], close[3], close[4]])
+                img_path = os.path.join(OUT_DIR, f"marker_{m_id}_frame_{close[4]}.png")
+                cv2.imwrite(img_path, close[5])
+                print(f"✔ Saved snapshot → {img_path}")
+
+
+if __name__ == "__main__":
+    main()
+
