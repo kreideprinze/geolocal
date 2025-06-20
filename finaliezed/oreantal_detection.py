@@ -76,7 +76,7 @@ def cam_to_world(tvec_cam, roll, pitch, yaw):
 
 # === Main Execution ===
 def main():
-    cap = cv2.VideoCapture("/dev/video4")
+    cap = cv2.VideoCapture("/dev/video0")
     if not cap.isOpened():
         raise IOError("❌ Camera not accessible")
 
