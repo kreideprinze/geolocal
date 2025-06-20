@@ -12,10 +12,9 @@ from collections import defaultdict
 camera_matrix = np.array(
     [[448.44050858, 0, 302.36894562], [0, 450.05835973, 244.72255502], [0, 0, 1]]
 )
-
 dist_coeffs = np.array([0.26974184, -1.56360967, -0.00950144, -0.00800682, 3.5658071])
-
 marker_size = 0.5
+
 
 def load_cam_to_drone_transform(path="cam_to_drone_transform.csv"):
     try:
@@ -55,10 +54,9 @@ marker_data = defaultdict(list)
 
 def connect_to_sitl():
     try:
-        string = input("Enter SITL connection string: ")
-        if not string:
-            string = "/dev/ttyACM0"  # Default for Raspberry Pi
-        master = mavutil.mavlink_connection(string, baud=57600)
+        master = mavutil.mavlink_connection(
+            input("Enter connection string (e.g. udp:127.0.0.1:14550) : ")
+        )
         master.wait_heartbeat(timeout=10)
         print("✔ Connected to vehicle")
         return master
