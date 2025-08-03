@@ -44,7 +44,7 @@ out_writer = None
 
 def telemetry_thread():
     global current_lat, current_lon, current_alt, current_yaw_deg, base_alt, current_roll, current_pitch
-    master = mavutil.mavlink_connection("/dev/ttyACM0") # "udp:127.0.0.1:14550"
+    master = mavutil.mavlink_connection("udp:127.0.0.1:14550") # "udp:127.0.0.1:14550"
     master.wait_heartbeat()
     print("[INFO] MAVLink connected.")
 
@@ -88,7 +88,10 @@ def haversine(lat1, lon1, lat2, lon2):
 # CSV logging
 csv_file = open('detections.csv', 'w', newline='')
 csv_writer = csv.writer(csv_file)
-csv_writer.writerow(["Frame", "ID", "Altitude_m", "GroundDist_m", "Lat", "Lon"])
+csv_writer.writerow([
+    "Frame", "ID", "Altitude_m", "GroundDist_m",
+    "Person_Lat", "Person_Lon", "Drone_Lat", "Drone_Lon"
+])
 csv_lock = threading.Lock()
 
 # Weighted result output
@@ -97,7 +100,7 @@ weighted_csv_writer = csv.writer(weighted_csv_file)
 weighted_csv_writer.writerow(["ID", "Avg_Lat", "Avg_Lon", "Min_Weighted_Dist"])
 
 # Open video
-cap = cv2.VideoCapture('/dev/video6')
+cap = cv2.VideoCapture(0) #"/dev/video6"
 frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 fps = cap.get(cv2.CAP_PROP_FPS)
@@ -169,7 +172,7 @@ while running and cap.isOpened():
             box_center = np.array([cx, cy])
 
             pix_d_px = np.linalg.norm(box_center - image_center)
-            ground_dist_cm = plane2plane_dist_cm * (pix_d_px / focal_len_px)
+            ground_dist_cm = plane2plane_dist_m * (pix_d_px / focal_len_px)
             ground_dist_m = ground_dist_cm / 100.0
 
             person_lat, person_lon = offset_gps(lat, lon, ground_dist_m, yaw_deg)
@@ -195,8 +198,19 @@ while running and cap.isOpened():
             cv2.putText(frame, label, (int(x1), int(y1 - 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (50, 255, 50), 2)
             cv2.putText(frame, breakdown_label, (int(x1), int(y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 255, 255), 2)
 
-            csv_lock.acquire()
-            csv_writer.writerow([frame_num, id_str, round(alt, 2), round(ground_dist_m, 2), person_lat, person_lon])
+            csv_lock.acquire() 
+            csv_writer.writerow([
+                frame_num,
+                 id_str,
+                 round(alt, 2),
+                 round(ground_dist_m, 2),
+                 person_lat,
+                 person_lon,
+                 lat,
+                 lon
+             ])
+
+            
             csv_lock.release()
 
     cv2.imshow("Detection Feed", frame)
