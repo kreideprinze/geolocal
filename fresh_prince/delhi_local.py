@@ -35,16 +35,19 @@ running = True
 
 # Track detections
 tracked_ids = {}
-
-# Weighted result storage
 weighted_results = {}
+
+# FPS tracking
+fps_time_start = time.time()
+frame_counter = 0
+fps_value = 0
 
 # Video writer
 out_writer = None
 
 def telemetry_thread():
     global current_lat, current_lon, current_alt, current_yaw_deg, base_alt, current_roll, current_pitch
-    master = mavutil.mavlink_connection("udp:127.0.0.1:14550") # "udp:127.0.0.1:14550"
+    master = mavutil.mavlink_connection("udp:127.0.0.1:14550")
     master.wait_heartbeat()
     print("[INFO] MAVLink connected.")
 
@@ -100,7 +103,7 @@ weighted_csv_writer = csv.writer(weighted_csv_file)
 weighted_csv_writer.writerow(["ID", "Avg_Lat", "Avg_Lon", "Min_Weighted_Dist"])
 
 # Open video
-cap = cv2.VideoCapture(0) #"/dev/video6"
+cap = cv2.VideoCapture(0)
 frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 fps = cap.get(cv2.CAP_PROP_FPS)
@@ -118,26 +121,10 @@ signal.signal(signal.SIGINT, signal_handler)
 # Start telemetry thread
 threading.Thread(target=telemetry_thread, daemon=True).start()
 
-print("[INFO] Waiting for telemetry...")
-while True:
-    telemetry_lock.acquire()
-    lat_ready = current_lat is not None
-    lon_ready = current_lon is not None
-    alt_ready = current_alt is not None
-    yaw_ready = current_yaw_deg is not None
-    telemetry_lock.release()
-
-    if lat_ready and lon_ready and alt_ready and yaw_ready:
-        print("[INFO] Telemetry initialized. Starting video processing.")
-        break
-    else:
-        missing = []
-        if not lat_ready: missing.append("lat")
-        if not lon_ready: missing.append("lon")
-        if not alt_ready: missing.append("alt")
-        if not yaw_ready: missing.append("yaw")
-        print(f"[INFO] Waiting for: {', '.join(missing)}")
-        time.sleep(1)
+# Allow some time for telemetry, but don't block video
+print("[INFO] Waiting for telemetry (will proceed after 5s regardless of GPS lock)...")
+time.sleep(5)
+print("[INFO] Starting video processing.")
 
 while running and cap.isOpened():
     ret, frame = cap.read()
@@ -145,6 +132,13 @@ while running and cap.isOpened():
         break
 
     frame_num += 1
+    frame_counter += 1
+    if frame_counter >= 10:
+        now = time.time()
+        elapsed = now - fps_time_start
+        fps_value = frame_counter / elapsed
+        fps_time_start = now
+        frame_counter = 0
 
     telemetry_lock.acquire()
     lat = current_lat
@@ -155,7 +149,7 @@ while running and cap.isOpened():
     pitch = current_pitch
     telemetry_lock.release()
 
-    if None in (lat, lon, alt, yaw_deg) or alt < 0:
+    if alt is None or yaw_deg is None or alt < 0:
         continue
 
     plane2plane_dist_m = alt
@@ -175,8 +169,12 @@ while running and cap.isOpened():
             ground_dist_cm = plane2plane_dist_m * (pix_d_px / focal_len_px)
             ground_dist_m = ground_dist_cm / 100.0
 
-            person_lat, person_lon = offset_gps(lat, lon, ground_dist_m, yaw_deg)
-            id_str = f"{person_lat:.6f}_{person_lon:.6f}"
+            if lat is not None and lon is not None:
+                person_lat, person_lon = offset_gps(lat, lon, ground_dist_m, yaw_deg)
+                id_str = f"{person_lat:.6f}_{person_lon:.6f}"
+            else:
+                person_lat, person_lon = None, None
+                id_str = f"nogps_{frame_num}_{int(cx)}_{int(cy)}"
 
             weight = 1.0 / (1.0 + abs(roll) + abs(pitch) + ground_dist_m)
             if id_str not in weighted_results:
@@ -185,12 +183,11 @@ while running and cap.isOpened():
 
             tracked_ids[id_str] = (person_lat, person_lon)
 
-            # Heading breakdown
             delta_north = ground_dist_m * cos(radians(yaw_deg))
             delta_east = ground_dist_m * sin(radians(yaw_deg))
             breakdown_label = f"{ground_dist_m:.2f}m | N:{delta_north:.2f} E:{delta_east:.2f}"
 
-            label = f"{id_str}\nLat:{person_lat:.6f}, Lon:{person_lon:.6f}"
+            label = f"{id_str}\nLat:{person_lat if person_lat else 'NaN'}, Lon:{person_lon if person_lon else 'NaN'}"
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
             cv2.circle(frame, (int(cx), int(cy)), 5, (0, 0, 255), -1)
             cv2.circle(frame, (int(image_center[0]), int(image_center[1])), 5, (255, 0, 0), -1)
@@ -198,20 +195,26 @@ while running and cap.isOpened():
             cv2.putText(frame, label, (int(x1), int(y1 - 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (50, 255, 50), 2)
             cv2.putText(frame, breakdown_label, (int(x1), int(y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 255, 255), 2)
 
-            csv_lock.acquire() 
+            csv_lock.acquire()
             csv_writer.writerow([
                 frame_num,
-                 id_str,
-                 round(alt, 2),
-                 round(ground_dist_m, 2),
-                 person_lat,
-                 person_lon,
-                 lat,
-                 lon
-             ])
-
-            
+                id_str,
+                round(alt, 2),
+                round(ground_dist_m, 2),
+                person_lat if person_lat is not None else "NaN",
+                person_lon if person_lon is not None else "NaN",
+                lat if lat is not None else "NaN",
+                lon if lon is not None else "NaN"
+            ])
             csv_lock.release()
+
+    if lat is None or lon is None:
+        cv2.putText(frame, "No GPS Lock", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    else:
+        gps_status = f"Lat: {lat:.6f}, Lon: {lon:.6f}, Alt: {alt:.2f}m"
+        cv2.putText(frame, gps_status, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+    cv2.putText(frame, f"FPS: {fps_value:.2f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
     cv2.imshow("Detection Feed", frame)
     out_writer.write(frame)
@@ -225,8 +228,8 @@ csv_file.close()
 
 for pid, records in weighted_results.items():
     total_weight = sum(w for _, _, w, _ in records)
-    avg_lat = sum(lat * w for lat, _, w, _ in records) / total_weight
-    avg_lon = sum(lon * w for _, lon, w, _ in records) / total_weight
+    avg_lat = sum(lat * w for lat, _, w, _ in records if lat is not None) / total_weight
+    avg_lon = sum(lon * w for _, lon, w, _ in records if lon is not None) / total_weight
     min_dist = min(d for _, _, _, d in records)
     weighted_csv_writer.writerow([pid, avg_lat, avg_lon, min_dist])
 
